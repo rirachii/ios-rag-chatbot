@@ -61,7 +61,9 @@ class CoreDataManager {
     
     func createVectorEmbedding(vector: [Double], for message: CDChatMessage) -> CDVectorEmbedding {
         let embedding = CDVectorEmbedding(context: viewContext)
-        embedding.vector = try? JSONEncoder().encode(vector)
+        // Normalize vector before storing
+        let normalizedVector = VectorMath.normalize(vector)
+        embedding.vector = try? JSONEncoder().encode(normalizedVector)
         embedding.message = message
         return embedding
     }
@@ -71,21 +73,63 @@ class CoreDataManager {
         return try? JSONDecoder().decode([Double].self, from: data)
     }
     
-    // MARK: - Search Operations
+    // MARK: - Vector Similarity Search
     
-    func findSimilarMessages(to vector: [Double], limit: Int = 5) -> [CDChatMessage] {
-        let request: NSFetchRequest<CDChatMessage> = CDChatMessage.fetchRequest()
-        request.fetchLimit = limit
+    struct ScoredMessage {
+        let message: CDChatMessage
+        let similarity: Double
+    }
+    
+    func findSimilarMessages(to queryVector: [Double], limit: Int = 5) -> [CDChatMessage] {
+        // Normalize query vector
+        let normalizedQuery = VectorMath.normalize(queryVector)
         
-        // TODO: Implement vector similarity search
-        // For now, return most recent messages
-        request.sortDescriptors = [NSSortDescriptor(keyPath: \CDChatMessage.timestamp, ascending: false)]
+        // Fetch all messages with embeddings
+        let request: NSFetchRequest<CDChatMessage> = CDChatMessage.fetchRequest()
+        request.predicate = NSPredicate(format: "vectorEmbedding != nil")
         
         do {
-            return try viewContext.fetch(request)
+            let messages = try viewContext.fetch(request)
+            
+            // Calculate similarity scores
+            let scoredMessages: [ScoredMessage] = messages.compactMap { message in
+                guard let embedding = message.vectorEmbedding,
+                      let vector = getVector(from: embedding) else {
+                    return nil
+                }
+                
+                let similarity = VectorMath.cosineSimilarity(normalizedQuery, vector)
+                return ScoredMessage(message: message, similarity: similarity)
+            }
+            
+            // Sort by similarity and return top results
+            return scoredMessages
+                .sorted { $0.similarity > $1.similarity }
+                .prefix(limit)
+                .map { $0.message }
+            
         } catch {
-            print("Error fetching similar messages: \(error)")
+            print("Error fetching messages for similarity search: \(error)")
             return []
         }
+    }
+    
+    // MARK: - Batch Operations
+    
+    func batchDeleteAllData() {
+        let entityNames = ["CDChatMessage", "CDVectorEmbedding"]
+        
+        for entityName in entityNames {
+            let fetchRequest = NSFetchRequest<NSFetchRequestResult>(entityName: entityName)
+            let batchDeleteRequest = NSBatchDeleteRequest(fetchRequest: fetchRequest)
+            
+            do {
+                try viewContext.execute(batchDeleteRequest)
+            } catch {
+                print("Error batch deleting \(entityName): \(error)")
+            }
+        }
+        
+        saveContext()
     }
 }
