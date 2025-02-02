@@ -11,7 +11,6 @@ struct WaveformBar: Shape {
     func path(in rect: CGRect) -> Path {
         var path = Path()
         
-        // Create rounded rectangle for each bar
         let barWidth = rect.width
         let barHeight = rect.height * value
         
@@ -37,11 +36,11 @@ struct AudioWaveformView: View {
     let spacing: CGFloat = 4
     let minBarHeight: CGFloat = 3
     
-    // Keep track of previous levels for animation
     @State private var levels: [CGFloat] = []
-    
-    // Timer for animation
     let timer = Timer.publish(every: 0.05, on: .main, in: .common).autoconnect()
+    
+    // Previous sound level for threshold detection
+    @State private var previousSoundLevel: Float = 0
     
     var body: some View {
         HStack(spacing: spacing) {
@@ -68,19 +67,23 @@ struct AudioWaveformView: View {
         .onReceive(timer) { _ in
             updateLevels()
         }
+        .onChange(of: soundLevel) { newLevel in
+            // Trigger haptic feedback for significant level changes
+            if abs(newLevel - previousSoundLevel) > 0.3 {
+                HapticService.shared.audioLevelChanged(newLevel)
+            }
+            previousSoundLevel = newLevel
+        }
     }
     
     private func updateLevels() {
         var newLevels = levels
-        // Convert sound level to CGFloat (0-1 range)
         let currentLevel = CGFloat(min(max(soundLevel, 0), 1))
         
-        // Shift existing levels to the right
         for i in (1..<numberOfBars).reversed() {
             newLevels[i] = levels[i-1]
         }
         
-        // Add new level with some randomization for natural look
         let randomVariation = CGFloat.random(in: -0.1...0.1)
         newLevels[0] = max(currentLevel + randomVariation, minBarHeight)
         
@@ -88,30 +91,40 @@ struct AudioWaveformView: View {
     }
 }
 
-// MARK: - LiveAudioView
 struct LiveAudioView: View {
     @StateObject private var audioViewModel = LiveAudioViewModel()
+    @GestureState private var isPressed = false
     
     var body: some View {
         VStack {
             AudioWaveformView(soundLevel: $audioViewModel.soundLevel)
                 .padding()
             
-            HStack {
-                Button(action: {
-                    audioViewModel.isRecording ? audioViewModel.stopRecording() : audioViewModel.startRecording()
-                }) {
-                    Image(systemName: audioViewModel.isRecording ? "stop.circle.fill" : "mic.circle.fill")
-                        .font(.system(size: 44))
-                        .foregroundColor(audioViewModel.isRecording ? .red : .blue)
-                }
-                .padding()
+            Button(action: {
+                // Button tap handling moved to gesture
+            }) {
+                Image(systemName: audioViewModel.isRecording ? "stop.circle.fill" : "mic.circle.fill")
+                    .font(.system(size: 44))
+                    .foregroundColor(audioViewModel.isRecording ? .red : .blue)
+                    .scaleEffect(isPressed ? 0.9 : 1.0)
             }
+            .buttonStyle(PlainButtonStyle())
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 0)
+                    .updating($isPressed) { value, state, _ in
+                        state = true
+                        HapticService.shared.buttonPress()
+                    }
+                    .onEnded { _ in
+                        HapticService.shared.buttonRelease()
+                        audioViewModel.toggleRecording()
+                    }
+            )
+            .padding()
         }
     }
 }
 
-// MARK: - ViewModel
 class LiveAudioViewModel: NSObject, ObservableObject, VoiceServiceDelegate {
     @Published var soundLevel: Float = 0.0
     @Published var isRecording: Bool = false
@@ -123,14 +136,24 @@ class LiveAudioViewModel: NSObject, ObservableObject, VoiceServiceDelegate {
         voiceService.delegate = self
     }
     
-    func startRecording() {
-        voiceService.startRecording()
-        isRecording = true
+    func toggleRecording() {
+        if isRecording {
+            stopRecording()
+        } else {
+            startRecording()
+        }
     }
     
-    func stopRecording() {
+    private func startRecording() {
+        voiceService.startRecording()
+        isRecording = true
+        HapticService.shared.recordingStarted()
+    }
+    
+    private func stopRecording() {
         voiceService.stopRecording()
         isRecording = false
+        HapticService.shared.recordingStopped()
     }
     
     // MARK: - VoiceServiceDelegate
@@ -142,6 +165,7 @@ class LiveAudioViewModel: NSObject, ObservableObject, VoiceServiceDelegate {
     func voiceService(_ service: VoiceService, didFailWithError error: Error) {
         print("Error: \(error.localizedDescription)")
         isRecording = false
+        HapticService.shared.recordingError()
     }
     
     func voiceService(_ service: VoiceService, didUpdateSoundLevel level: Float) {
