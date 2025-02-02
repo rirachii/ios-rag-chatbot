@@ -2,17 +2,19 @@ import Foundation
 import Speech
 import AVFoundation
 
+protocol VoiceServiceDelegate: AnyObject {
+    func voiceService(_ service: VoiceService, didRecognizeText text: String)
+    func voiceService(_ service: VoiceService, didFailWithError error: Error)
+    func voiceService(_ service: VoiceService, didUpdateSoundLevel level: Float)
+    func voiceService(_ service: VoiceService, didDetectVoiceActivity isActive: Bool)
+}
+
 enum VoiceServiceError: Error {
     case notAuthorized
     case recognitionNotAvailable
     case audioEngineError
     case noAudioInput
-}
-
-protocol VoiceServiceDelegate: AnyObject {
-    func voiceService(_ service: VoiceService, didRecognizeText text: String)
-    func voiceService(_ service: VoiceService, didFailWithError error: Error)
-    func voiceService(_ service: VoiceService, didUpdateSoundLevel level: Float)
+    case vadError
 }
 
 class VoiceService: NSObject, SFSpeechRecognizerDelegate {
@@ -28,17 +30,27 @@ class VoiceService: NSObject, SFSpeechRecognizerDelegate {
     
     // Speech synthesis properties
     private let synthesizer = AVSpeechSynthesizer()
-    private var isRecording = false
     
-    // Sound level monitoring
-    private let LEVEL_LOWPASS_TRIG: Float32 = 0.30
-    private var previousLevel: Float32 = 0.0
+    // Voice Activity Detection
+    private let vadProcessor = VADProcessor()
+    private var isRecording = false
+    private var isProcessingVAD = false
+    
+    // Auto-stop properties
+    private var autoStopTimer: Timer?
+    private let maxSilenceDuration: TimeInterval = 2.0
     
     override private init() {
         self.speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
         super.init()
         self.speechRecognizer?.delegate = self
-        synthesizer.delegate = self
+        self.synthesizer.delegate = self
+        
+        // Set up VAD callback
+        vadProcessor.onVoiceStateChanged = { [weak self] isActive in
+            guard let self = self else { return }
+            self.handleVoiceActivityChange(isActive)
+        }
     }
     
     // MARK: - Authorization
@@ -49,11 +61,7 @@ class VoiceService: NSObject, SFSpeechRecognizerDelegate {
                 switch status {
                 case .authorized:
                     completion(.success(()))
-                case .denied:
-                    completion(.failure(VoiceServiceError.notAuthorized))
-                case .restricted:
-                    completion(.failure(VoiceServiceError.notAuthorized))
-                case .notDetermined:
+                case .denied, .restricted, .notDetermined:
                     completion(.failure(VoiceServiceError.notAuthorized))
                 @unknown default:
                     completion(.failure(VoiceServiceError.notAuthorized))
@@ -62,15 +70,16 @@ class VoiceService: NSObject, SFSpeechRecognizerDelegate {
         }
     }
     
-    // MARK: - Speech Recognition
+    // MARK: - Recording Control
     
     func startRecording() {
         // Check if we're already recording
         guard !isRecording else { return }
         
-        // Reset any existing task
+        // Reset states
         recognitionTask?.cancel()
         recognitionTask = nil
+        vadProcessor.reset()
         
         // Configure audio session
         do {
@@ -118,7 +127,10 @@ class VoiceService: NSObject, SFSpeechRecognizerDelegate {
             guard let self = self else { return }
             self.recognitionRequest?.append(buffer)
             
-            // Calculate sound level
+            // Process audio for VAD
+            self.vadProcessor.processBuffer(buffer)
+            
+            // Calculate and report sound level
             self.processSoundLevel(buffer)
         }
         
@@ -126,6 +138,7 @@ class VoiceService: NSObject, SFSpeechRecognizerDelegate {
         do {
             try audioEngine.start()
             isRecording = true
+            isProcessingVAD = true
         } catch {
             stopRecording()
             delegate?.voiceService(self, didFailWithError: error)
@@ -139,10 +152,56 @@ class VoiceService: NSObject, SFSpeechRecognizerDelegate {
             recognitionRequest?.endAudio()
         }
         
+        autoStopTimer?.invalidate()
+        autoStopTimer = nil
+        
         recognitionTask?.cancel()
         recognitionTask = nil
         recognitionRequest = nil
+        
         isRecording = false
+        isProcessingVAD = false
+        vadProcessor.reset()
+    }
+    
+    // MARK: - Voice Activity Detection
+    
+    private func handleVoiceActivityChange(_ isActive: Bool) {
+        delegate?.voiceService(self, didDetectVoiceActivity: isActive)
+        
+        if isActive {
+            // Cancel any pending auto-stop
+            autoStopTimer?.invalidate()
+            autoStopTimer = nil
+        } else {
+            // Start auto-stop timer when voice becomes inactive
+            autoStopTimer?.invalidate()
+            autoStopTimer = Timer.scheduledTimer(withTimeInterval: maxSilenceDuration, repeats: false) { [weak self] _ in
+                self?.stopRecording()
+            }
+        }
+    }
+    
+    // MARK: - Audio Processing
+    
+    private func processSoundLevel(_ buffer: AVAudioPCMBuffer) {
+        guard let channelData = buffer.floatChannelData?[0] else { return }
+        let frames = buffer.frameLength
+        
+        var sum: Float = 0.0
+        for frame in 0..<frames {
+            let sample = channelData[Int(frame)]
+            sum += sample * sample
+        }
+        
+        let rms = sqrt(sum / Float(frames))
+        let db = 20 * log10(rms)
+        let normalizedLevel = max(0.0, min(1.0, (db + 50) / 50))
+        
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.delegate?.voiceService(self, didUpdateSoundLevel: normalizedLevel)
+        }
     }
     
     // MARK: - Speech Synthesis
@@ -157,35 +216,12 @@ class VoiceService: NSObject, SFSpeechRecognizerDelegate {
         synthesizer.speak(utterance)
     }
     
-    // MARK: - Private Helper Methods
+    // MARK: - Private Helpers
     
     private func configureAudioSession() throws {
         let audioSession = AVAudioSession.sharedInstance()
         try audioSession.setCategory(.record, mode: .measurement, options: .duckOthers)
         try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
-    }
-    
-    private func processSoundLevel(_ buffer: AVAudioPCMBuffer) {
-        guard let channelData = buffer.floatChannelData?[0] else { return }
-        let frames = buffer.frameLength
-        
-        var sumSquares: Float32 = 0.0
-        for frame in 0..<frames {
-            let sample = channelData[Int(frame)]
-            sumSquares += sample * sample
-        }
-        
-        let avgPower = 10 * log10f(sumSquares / Float32(frames))
-        let level = max(0.0, (avgPower + 50) / 50) // Normalize to 0-1
-        
-        // Apply low-pass filter
-        let smoothedLevel = previousLevel * LEVEL_LOWPASS_TRIG + level * (1.0 - LEVEL_LOWPASS_TRIG)
-        previousLevel = smoothedLevel
-        
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            self.delegate?.voiceService(self, didUpdateSoundLevel: smoothedLevel)
-        }
     }
 }
 
@@ -194,17 +230,5 @@ class VoiceService: NSObject, SFSpeechRecognizerDelegate {
 extension VoiceService: AVSpeechSynthesizerDelegate {
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
         // Handle speech completion if needed
-    }
-    
-    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didPause utterance: AVSpeechUtterance) {
-        // Handle speech pause if needed
-    }
-    
-    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didContinue utterance: AVSpeechUtterance) {
-        // Handle speech continuation if needed
-    }
-    
-    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        // Handle speech cancellation if needed
     }
 }
