@@ -3,12 +3,22 @@
     <entity name="CDChatMessage" representedClassName="CDChatMessage" syncable="YES" codeGenerationType="class">
         <attribute name="content" attributeType="String"/>
         <attribute name="id" attributeType="UUID" usesScalarValueType="NO"/>
-        <attribute name="isUser" attributeType="Boolean" usesScalarValueType="YES"/>
-        <attribute name="timestamp" attributeType="Date" usesScalarValueType="NO"/>
+        <attribute name="isUser" attributeType="Boolean" usesScalarValueType="YES" indexed="YES"/>
+        <attribute name="timestamp" attributeType="Date" usesScalarValueType="NO" indexed="YES"/>
         <relationship name="vectorEmbedding" optional="YES" maxCount="1" deletionRule="Cascade" destinationEntity="CDVectorEmbedding" inverseName="message" inverseEntity="CDVectorEmbedding"/>
+        <fetchIndex name="byTimestampIndex">
+            <fetchIndexElement property="timestamp" type="Binary" order="descending"/>
+        </fetchIndex>
+        <fetchIndex name="byIsUserAndTimestampIndex">
+            <fetchIndexElement property="isUser" type="Binary"/>
+            <fetchIndexElement property="timestamp" type="Binary" order="descending"/>
+        </fetchIndex>
     </entity>
     <entity name="CDVectorEmbedding" representedClassName="CDVectorEmbedding" syncable="YES" codeGenerationType="class">
         <attribute name="vector" attributeType="Binary"/>
-        <relationship name="message" optional="YES" maxCount="1" deletionRule="Nullify" destinationEntity="CDChatMessage" inverseName="vectorEmbedding" inverseEntity="CDChatMessage"/>
+        <relationship name="message" optional="YES" maxCount="1" deletionRule="Nullify" destinationEntity="CDChatMessage" inverseName="vectorEmbedding" inverseEntity="CDChatMessage" indexed="YES"/>
+        <fetchIndex name="byMessageIndex">
+            <fetchIndexElement property="message" type="Binary"/>
+        </fetchIndex>
     </entity>
 </model>
