@@ -7,23 +7,61 @@ class StorageService {
     private let coreDataManager = CoreDataManager.shared
     private let embedding = NLEmbedding.wordEmbedding(for: .english)
     
+    // Cache frequently accessed embeddings
+    private var embeddingCache: NSCache<NSString, NSArray> = {
+        let cache = NSCache<NSString, NSArray>()
+        cache.countLimit = 1000 // Adjust based on memory constraints
+        return cache
+    }()
+    
     private init() {}
     
     // MARK: - Message Operations
     
     func saveMessage(_ message: ChatMessage) {
-        let cdMessage = coreDataManager.createChatMessage(content: message.content, isUser: message.isUser)
-        
-        // Generate and save embedding for the message
-        if let vector = computeEmbedding(for: message.content) {
-            _ = coreDataManager.createVectorEmbedding(vector: vector, for: cdMessage)
+        coreDataManager.performBackgroundTask { context in
+            let cdMessage = CDChatMessage(context: context)
+            cdMessage.id = message.id
+            cdMessage.content = message.content
+            cdMessage.isUser = message.isUser
+            cdMessage.timestamp = message.timestamp
+            
+            // Generate and save embedding
+            if let vector = self.computeEmbedding(for: message.content) {
+                let embedding = CDVectorEmbedding(context: context)
+                embedding.vector = try? JSONEncoder().encode(vector)
+                embedding.message = cdMessage
+                
+                // Cache the embedding
+                self.cacheEmbedding(vector, for: message.id.uuidString)
+            }
+            
+            try? context.save()
         }
-        
-        coreDataManager.saveContext()
     }
     
-    func fetchMessages() -> [ChatMessage] {
-        let cdMessages = coreDataManager.fetchAllMessages()
+    func saveMessages(_ messages: [ChatMessage]) {
+        coreDataManager.performBackgroundTask { context in
+            for message in messages {
+                let cdMessage = CDChatMessage(context: context)
+                cdMessage.id = message.id
+                cdMessage.content = message.content
+                cdMessage.isUser = message.isUser
+                cdMessage.timestamp = message.timestamp
+                
+                if let vector = self.computeEmbedding(for: message.content) {
+                    let embedding = CDVectorEmbedding(context: context)
+                    embedding.vector = try? JSONEncoder().encode(vector)
+                    embedding.message = cdMessage
+                    self.cacheEmbedding(vector, for: message.id.uuidString)
+                }
+            }
+            try? context.save()
+        }
+    }
+    
+    func fetchMessages(limit: Int = 50) -> [ChatMessage] {
+        let cdMessages = coreDataManager.fetchMessages(limit: limit)
         return cdMessages.map { cdMessage in
             ChatMessage(
                 id: cdMessage.id ?? UUID(),
@@ -35,21 +73,34 @@ class StorageService {
     
     // MARK: - Vector Operations
     
+    private func cacheEmbedding(_ vector: [Double], for key: String) {
+        embeddingCache.setObject(vector as NSArray, forKey: key as NSString)
+    }
+    
+    private func getCachedEmbedding(for key: String) -> [Double]? {
+        return embeddingCache.object(forKey: key as NSString) as? [Double]
+    }
+    
     func computeEmbedding(for text: String) -> [Double]? {
         guard let embedding = embedding else { return nil }
         
-        // Split text into words and compute average embedding
+        // Preprocess text
         let words = text.components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .prefix(100) // Limit to prevent processing extremely long texts
+        
         var vectors: [[Double]] = []
         
+        // Get embeddings for each word
         for word in words {
             if let vector = embedding.vector(for: word) {
                 vectors.append(vector)
             }
         }
         
-        // Calculate average vector
         guard !vectors.isEmpty else { return nil }
+        
+        // Calculate weighted average of vectors
         let vectorLength = vectors[0].count
         var averageVector = Array(repeating: 0.0, count: vectorLength)
         
@@ -59,8 +110,12 @@ class StorageService {
             }
         }
         
-        return averageVector.map { $0 / Double(vectors.count) }
+        // Normalize the final vector
+        let finalVector = averageVector.map { $0 / Double(vectors.count) }
+        return VectorMath.normalize(finalVector)
     }
+    
+    // MARK: - Semantic Search
     
     func findSimilarMessages(to query: String, limit: Int = 5) -> [ChatMessage] {
         guard let queryVector = computeEmbedding(for: query) else { return [] }
@@ -73,5 +128,51 @@ class StorageService {
                 isUser: cdMessage.isUser
             )
         }
+    }
+    
+    func findSimilarMessagesByVector(_ vector: [Double], limit: Int = 5) -> [ChatMessage] {
+        let cdMessages = coreDataManager.findSimilarMessages(to: vector, limit: limit)
+        return cdMessages.map { cdMessage in
+            ChatMessage(
+                id: cdMessage.id ?? UUID(),
+                content: cdMessage.content ?? "",
+                isUser: cdMessage.isUser
+            )
+        }
+    }
+    
+    // MARK: - Performance Optimization
+    
+    func precomputeEmbeddings(forMessagesMatching predicate: NSPredicate? = nil) {
+        coreDataManager.performBackgroundTask { context in
+            let request: NSFetchRequest<CDChatMessage> = CDChatMessage.fetchRequest()
+            request.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [
+                NSPredicate(format: "vectorEmbedding == nil"),
+                predicate
+            ].compactMap { $0 })
+            
+            do {
+                let messages = try context.fetch(request)
+                for message in messages {
+                    if let content = message.content,
+                       let vector = self.computeEmbedding(for: content) {
+                        let embedding = CDVectorEmbedding(context: context)
+                        embedding.vector = try? JSONEncoder().encode(vector)
+                        embedding.message = message
+                        
+                        if let id = message.id?.uuidString {
+                            self.cacheEmbedding(vector, for: id)
+                        }
+                    }
+                }
+                try context.save()
+            } catch {
+                print("Error precomputing embeddings: \(error)")
+            }
+        }
+    }
+    
+    func clearEmbeddingCache() {
+        embeddingCache.removeAllObjects()
     }
 }
