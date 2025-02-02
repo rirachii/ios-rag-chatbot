@@ -4,45 +4,74 @@ import NaturalLanguage
 
 class StorageService {
     static let shared = StorageService()
-    
-    private init() {
-        setupCoreData()
-    }
-    
-    // MARK: - Core Data
-    private var persistentContainer: NSPersistentContainer!
-    
-    private func setupCoreData() {
-        persistentContainer = NSPersistentContainer(name: "RAGChatbot")
-        persistentContainer.loadPersistentStores { description, error in
-            if let error = error {
-                fatalError("Core Data store failed to load: \(error.localizedDescription)")
-            }
-        }
-    }
-    
-    // MARK: - Vector Storage
-    private var vectorStore: [String: [Double]] = [:] // Simple in-memory vector store
+    private let coreDataManager = CoreDataManager.shared
     private let embedding = NLEmbedding.wordEmbedding(for: .english)
     
-    func computeEmbedding(for text: String) -> [Double]? {
-        // TODO: Implement text embedding using NLEmbedding
-        return nil
-    }
+    private init() {}
     
-    func findSimilarEntries(to query: String, limit: Int = 5) -> [String] {
-        // TODO: Implement cosine similarity search
-        return []
-    }
+    // MARK: - Message Operations
     
-    // MARK: - Structured Storage
     func saveMessage(_ message: ChatMessage) {
-        let context = persistentContainer.viewContext
-        // TODO: Implement Core Data entity creation and saving
+        let cdMessage = coreDataManager.createChatMessage(content: message.content, isUser: message.isUser)
+        
+        // Generate and save embedding for the message
+        if let vector = computeEmbedding(for: message.content) {
+            _ = coreDataManager.createVectorEmbedding(vector: vector, for: cdMessage)
+        }
+        
+        coreDataManager.saveContext()
     }
     
     func fetchMessages() -> [ChatMessage] {
-        // TODO: Implement Core Data fetch request
-        return []
+        let cdMessages = coreDataManager.fetchAllMessages()
+        return cdMessages.map { cdMessage in
+            ChatMessage(
+                id: cdMessage.id ?? UUID(),
+                content: cdMessage.content ?? "",
+                isUser: cdMessage.isUser
+            )
+        }
+    }
+    
+    // MARK: - Vector Operations
+    
+    func computeEmbedding(for text: String) -> [Double]? {
+        guard let embedding = embedding else { return nil }
+        
+        // Split text into words and compute average embedding
+        let words = text.components(separatedBy: .whitespacesAndNewlines)
+        var vectors: [[Double]] = []
+        
+        for word in words {
+            if let vector = embedding.vector(for: word) {
+                vectors.append(vector)
+            }
+        }
+        
+        // Calculate average vector
+        guard !vectors.isEmpty else { return nil }
+        let vectorLength = vectors[0].count
+        var averageVector = Array(repeating: 0.0, count: vectorLength)
+        
+        for vector in vectors {
+            for (index, value) in vector.enumerated() {
+                averageVector[index] += value
+            }
+        }
+        
+        return averageVector.map { $0 / Double(vectors.count) }
+    }
+    
+    func findSimilarMessages(to query: String, limit: Int = 5) -> [ChatMessage] {
+        guard let queryVector = computeEmbedding(for: query) else { return [] }
+        
+        let cdMessages = coreDataManager.findSimilarMessages(to: queryVector, limit: limit)
+        return cdMessages.map { cdMessage in
+            ChatMessage(
+                id: cdMessage.id ?? UUID(),
+                content: cdMessage.content ?? "",
+                isUser: cdMessage.isUser
+            )
+        }
     }
 }
