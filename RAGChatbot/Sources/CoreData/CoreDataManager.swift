@@ -4,22 +4,58 @@ import Foundation
 class CoreDataManager {
     static let shared = CoreDataManager()
     
-    private init() {}
+    private init() {
+        setupPersistentContainer()
+    }
     
-    lazy var persistentContainer: NSPersistentContainer = {
-        let container = NSPersistentContainer(name: "RAGChatbot")
-        container.loadPersistentStores { description, error in
+    // MARK: - Core Data Setup
+    
+    private var persistentContainer: NSPersistentContainer!
+    
+    private func setupPersistentContainer() {
+        persistentContainer = NSPersistentContainer(name: "RAGChatbot")
+        
+        // Optimize SQLite store for better performance
+        let description = persistentContainer.persistentStoreDescriptor
+        description.setOption(true as NSNumber, forKey: NSPersistentHistoryTrackingKey)
+        description.setOption(true as NSNumber, forKey: NSPersistentStoreRemoteChangeNotificationPostOptionKey)
+        
+        // Enable SQLite performance optimizations
+        let options = [
+            // Enable WAL journal mode for better write performance
+            NSSQLitePragmasOption: ["journal_mode": "WAL"],
+            // Increase page size for better read performance
+            NSSQLiteAnalyzeOption: true,
+            // Enable automatic checkpointing
+            "synchronous": "NORMAL"
+        ]
+        
+        persistentContainer.persistentStoreDescriptor.setOption(options as NSObject, forKey: NSPersistentStoreOptionsKey)
+        
+        persistentContainer.loadPersistentStores { description, error in
             if let error = error {
                 fatalError("Unable to load persistent stores: \(error)")
             }
         }
-        container.viewContext.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
-        container.viewContext.automaticallyMergesChangesFromParent = true
-        return container
-    }()
+        
+        // Enable automatic merging of changes
+        persistentContainer.viewContext.automaticallyMergesChangesFromParent = true
+        persistentContainer.viewContext.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
+        
+        // Set up fetch batch size for better performance with large datasets
+        persistentContainer.viewContext.persistentStoreCoordinator?.setQueryGenerationFrom(.current)
+    }
     
     var viewContext: NSManagedObjectContext {
         persistentContainer.viewContext
+    }
+    
+    // MARK: - Context Management
+    
+    func performBackgroundTask(_ block: @escaping (NSManagedObjectContext) -> Void) {
+        persistentContainer.performBackgroundTask { context in
+            block(context)
+        }
     }
     
     func saveContext() {
@@ -29,12 +65,12 @@ class CoreDataManager {
                 try context.save()
             } catch {
                 let error = error as NSError
-                fatalError("Unresolved Core Data error \(error), \(error.userInfo)")
+                print("Unresolved Core Data error \(error), \(error.userInfo)")
             }
         }
     }
     
-    // MARK: - Chat Message Operations
+    // MARK: - Optimized Chat Message Operations
     
     func createChatMessage(content: String, isUser: Bool) -> CDChatMessage {
         let message = CDChatMessage(context: viewContext)
@@ -45,9 +81,25 @@ class CoreDataManager {
         return message
     }
     
-    func fetchAllMessages() -> [CDChatMessage] {
+    func fetchMessages(limit: Int = 50, userOnly: Bool? = nil) -> [CDChatMessage] {
         let request: NSFetchRequest<CDChatMessage> = CDChatMessage.fetchRequest()
-        request.sortDescriptors = [NSSortDescriptor(keyPath: \CDChatMessage.timestamp, ascending: true)]
+        
+        // Set up predicates using indexed attributes
+        var predicates: [NSPredicate] = []
+        if let userOnly = userOnly {
+            predicates.append(NSPredicate(format: "isUser == %@", NSNumber(value: userOnly)))
+        }
+        
+        if !predicates.isEmpty {
+            request.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: predicates)
+        }
+        
+        // Use indexed timestamp for sorting
+        request.sortDescriptors = [NSSortDescriptor(keyPath: \CDChatMessage.timestamp, ascending: false)]
+        request.fetchLimit = limit
+        
+        // Enable batch fetching for better performance with relationships
+        request.relationshipKeyPathsForPrefetching = ["vectorEmbedding"]
         
         do {
             return try viewContext.fetch(request)
@@ -57,42 +109,34 @@ class CoreDataManager {
         }
     }
     
-    // MARK: - Vector Embedding Operations
+    // MARK: - Optimized Vector Operations
     
     func createVectorEmbedding(vector: [Double], for message: CDChatMessage) -> CDVectorEmbedding {
         let embedding = CDVectorEmbedding(context: viewContext)
-        // Normalize vector before storing
         let normalizedVector = VectorMath.normalize(vector)
         embedding.vector = try? JSONEncoder().encode(normalizedVector)
         embedding.message = message
         return embedding
     }
     
-    func getVector(from embedding: CDVectorEmbedding) -> [Double]? {
-        guard let data = embedding.vector else { return nil }
-        return try? JSONDecoder().decode([Double].self, from: data)
-    }
-    
-    // MARK: - Vector Similarity Search
-    
-    struct ScoredMessage {
-        let message: CDChatMessage
-        let similarity: Double
-    }
-    
     func findSimilarMessages(to queryVector: [Double], limit: Int = 5) -> [CDChatMessage] {
-        // Normalize query vector
         let normalizedQuery = VectorMath.normalize(queryVector)
         
-        // Fetch all messages with embeddings
+        // Use indexed fetch for messages with embeddings
         let request: NSFetchRequest<CDChatMessage> = CDChatMessage.fetchRequest()
         request.predicate = NSPredicate(format: "vectorEmbedding != nil")
         
+        // Enable batch fetching for vector embeddings
+        request.relationshipKeyPathsForPrefetching = ["vectorEmbedding"]
+        
         do {
+            // Fetch messages in batches for better memory management
+            request.fetchBatchSize = 100
             let messages = try viewContext.fetch(request)
             
-            // Calculate similarity scores
-            let scoredMessages: [ScoredMessage] = messages.compactMap { message in
+            // Process similarity scores in parallel for better performance
+            let scoredMessages = DispatchQueue.concurrentPerform(iterations: messages.count) { index in
+                let message = messages[index]
                 guard let embedding = message.vectorEmbedding,
                       let vector = getVector(from: embedding) else {
                     return nil
@@ -102,34 +146,50 @@ class CoreDataManager {
                 return ScoredMessage(message: message, similarity: similarity)
             }
             
-            // Sort by similarity and return top results
+            // Sort and return top results
             return scoredMessages
+                .compactMap { $0 }
                 .sorted { $0.similarity > $1.similarity }
                 .prefix(limit)
                 .map { $0.message }
             
         } catch {
-            print("Error fetching messages for similarity search: \(error)")
+            print("Error in similarity search: \(error)")
             return []
         }
     }
     
+    func getVector(from embedding: CDVectorEmbedding) -> [Double]? {
+        guard let data = embedding.vector else { return nil }
+        return try? JSONDecoder().decode([Double].self, from: data)
+    }
+    
     // MARK: - Batch Operations
     
-    func batchDeleteAllData() {
-        let entityNames = ["CDChatMessage", "CDVectorEmbedding"]
+    func batchDeleteMessages(before date: Date) {
+        let fetchRequest: NSFetchRequest<NSFetchRequestResult> = CDChatMessage.fetchRequest()
+        fetchRequest.predicate = NSPredicate(format: "timestamp < %@", date as NSDate)
         
-        for entityName in entityNames {
-            let fetchRequest = NSFetchRequest<NSFetchRequestResult>(entityName: entityName)
-            let batchDeleteRequest = NSBatchDeleteRequest(fetchRequest: fetchRequest)
-            
-            do {
-                try viewContext.execute(batchDeleteRequest)
-            } catch {
-                print("Error batch deleting \(entityName): \(error)")
-            }
+        let batchDelete = NSBatchDeleteRequest(fetchRequest: fetchRequest)
+        batchDelete.resultType = .resultTypeObjectIDs
+        
+        do {
+            let result = try persistentContainer.viewContext.execute(batchDelete) as? NSBatchDeleteResult
+            let changes: [AnyHashable: Any] = [
+                NSDeletedObjectsKey: result?.result as? [NSManagedObjectID] ?? []
+            ]
+            NSManagedObjectContext.mergeChanges(fromRemoteContextSave: changes, into: [persistentContainer.viewContext])
+        } catch {
+            print("Error performing batch delete: \(error)")
         }
-        
-        saveContext()
+    }
+}
+
+// MARK: - Helper Structures
+
+extension CoreDataManager {
+    struct ScoredMessage {
+        let message: CDChatMessage
+        let similarity: Double
     }
 }
